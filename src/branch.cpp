@@ -18,8 +18,11 @@
 
 #include "branch.hpp"
 #include "ef.hpp"
+#include "from_string.hpp"
 #include "fs_glob.hpp"
 #include "fs_realpathize.hpp"
+#include "nonstd/optional.hpp"
+#include "num.hpp"
 #include "str.hpp"
 
 #include <string>
@@ -29,24 +32,81 @@
 
 using std::string;
 using std::vector;
+using nonstd::optional;
+
+
+Branch::Branch(const uint64_t &default_minfreespace_)
+  : _default_minfreespace(&default_minfreespace_)
+{
+}
+
+int
+Branch::from_string(const std::string &str_)
+{
+  return -EINVAL;
+}
+
+std::string
+Branch::to_string(void) const
+{
+  std::string rv;
+
+  rv  = path;
+  rv += '=';
+  switch(mode)
+    {
+    default:
+    case Branch::Mode::RW:
+      rv += "RW";
+      break;
+    case Branch::Mode::RO:
+      rv += "RO";
+      break;
+    case Branch::Mode::NC:
+      rv += "NC";
+      break;
+    }
+
+  if(_minfreespace.has_value())
+    {
+      rv += ',';
+      rv += num::humanize(_minfreespace.value());
+    }
+
+  return rv;
+}
+
+void
+Branch::set_minfreespace(const uint64_t minfreespace_)
+{
+  _minfreespace = minfreespace_;
+}
+
+uint64_t
+Branch::minfreespace(void) const
+{
+  if(_minfreespace.has_value())
+    return _minfreespace.value();
+  return *_default_minfreespace;
+}
 
 bool
 Branch::ro(void) const
 {
-  return (mode == Branch::RO);
+  return (mode == Branch::Mode::RO);
 }
 
 bool
 Branch::nc(void) const
 {
-  return (mode == Branch::NC);
+  return (mode == Branch::Mode::NC);
 }
 
 bool
 Branch::ro_or_nc(void) const
 {
-  return ((mode == Branch::RO) ||
-          (mode == Branch::NC));
+  return ((mode == Branch::Mode::RO) ||
+          (mode == Branch::Mode::NC));
 }
 
 static
@@ -63,91 +123,143 @@ split(const std::string &s_,
     *values_ = s_.substr(offset);
 }
 
-Branches::Branches()
+Branches::Branches(const uint64_t &default_minfreespace_)
+  : default_minfreespace(default_minfreespace_)
 {
   pthread_rwlock_init(&lock,NULL);
 }
 
 static
-void
-parse(const string &str_,
-      Branches     &branches_)
+int
+parse_mode(const string &str_,
+           Branch::Mode *mode_)
 {
-  string str;
-  Branch branch;
-  vector<string> globbed;
-
-  str = str_;
-  branch.mode = Branch::INVALID;
-  if(str::endswith(str,"=RO"))
-    branch.mode = Branch::RO;
-  ef(str::endswith(str,"=RW"))
-    branch.mode = Branch::RW;
-  ef(str::endswith(str,"=NC"))
-    branch.mode = Branch::NC;
-
-  if(branch.mode != Branch::INVALID)
-    str.resize(str.size() - 3);
+  if(str_ == "RW")
+    *mode_ = Branch::Mode::RW;
+  ef(str_ == "RO")
+    *mode_ = Branch::Mode::RO;
+  ef(str_ == "NC")
+     *mode_ = Branch::Mode::NC;
   else
-    branch.mode = Branch::RW;
+    return -EINVAL;
 
-  fs::glob(str,&globbed);
+  return 0;
+}
+
+static
+int
+parse_minfreespace(const string       &str_,
+                   optional<uint64_t> *minfreespace_)
+{
+  int rv;
+  uint64_t uint64;
+
+  rv = str::from(str_,&uint64);
+  if(rv < 0)
+    return rv;
+
+  *minfreespace_ = uint64;
+
+  return 0;
+}
+
+static
+int
+parse_branch(const string       &str_,
+             string             *glob_,
+             Branch::Mode       *mode_,
+             optional<uint64_t> *minfreespace_)
+{
+  int rv;
+  string options;
+  vector<string> v;
+
+  str::split(str_,'=',&v);
+  switch(v.size())
+    {
+    case 1:
+      *glob_ = v[0];
+      *mode_ = Branch::Mode::RW;
+      break;
+    case 2:
+      *glob_  = v[0];
+      options = v[1];
+      v.clear();
+      str::split(options,',',&v);
+      switch(v.size())
+        {
+        case 2:
+          rv = parse_minfreespace(v[1],minfreespace_);
+          if(rv < 0)
+            return rv;
+        case 1:
+          rv = parse_mode(v[0],mode_);
+          if(rv < 0)
+            return rv;
+        }
+      break;
+    }
+
+  return 0;
+}
+
+static
+int
+parse(const string   &str_,
+      const uint64_t &default_minfreespace_,
+      BranchVec      *branches_)
+{
+  int rv;
+  string glob;
+  vector<string> globbed;
+  optional<uint64_t> minfreespace;
+  Branch branch(default_minfreespace_);
+
+  rv = parse_branch(str_,&glob,&branch.mode,&minfreespace);
+  if(rv < 0)
+    return rv;
+
+  if(minfreespace.has_value())
+    branch.set_minfreespace(minfreespace.value());
+
+  fs::glob(glob,&globbed);
   fs::realpathize(&globbed);
   for(size_t i = 0; i < globbed.size(); i++)
     {
       branch.path = globbed[i];
-      branches_.push_back(branch);
+      branches_->push_back(branch);
     }
+
+  return 0;
 }
 
 static
 void
-set(Branches          &branches_,
-    const std::string &str_)
+set(const std::string &str_,
+    Branches          *branches_)
 {
   vector<string> paths;
 
-  branches_.clear();
+  branches_->vec.clear();
 
   str::split(str_,':',&paths);
 
   for(size_t i = 0; i < paths.size(); i++)
     {
-      Branches tmp;
+      BranchVec tmp;
 
-      parse(paths[i],tmp);
+      ::parse(paths[i],branches_->default_minfreespace,&tmp);
 
-      branches_.insert(branches_.end(),
-                       tmp.begin(),
-                       tmp.end());
+      branches_->vec.insert(branches_->vec.end(),
+                            tmp.begin(),
+                            tmp.end());
     }
 }
 
 static
 void
-add_begin(Branches          &branches_,
-          const std::string &str_)
-{
-  vector<string> paths;
-
-  str::split(str_,':',&paths);
-
-  for(size_t i = 0; i < paths.size(); i++)
-    {
-      Branches tmp;
-
-      parse(paths[i],tmp);
-
-      branches_.insert(branches_.begin(),
-                       tmp.begin(),
-                       tmp.end());
-    }
-}
-
-static
-void
-add_end(Branches          &branches_,
-        const std::string &str_)
+add_begin(const std::string &str_,
+          Branches          *branches_)
 {
   vector<string> paths;
 
@@ -155,41 +267,62 @@ add_end(Branches          &branches_,
 
   for(size_t i = 0; i < paths.size(); i++)
     {
-      Branches tmp;
+      BranchVec tmp;
 
-      parse(paths[i],tmp);
+      ::parse(paths[i],branches_->default_minfreespace,&tmp);
 
-      branches_.insert(branches_.end(),
-                       tmp.begin(),
-                       tmp.end());
+      branches_->vec.insert(branches_->vec.begin(),
+                            tmp.begin(),
+                            tmp.end());
     }
 }
 
 static
 void
-erase_begin(Branches &branches_)
+add_end(const std::string &str_,
+        Branches          *branches_)
 {
-  branches_.erase(branches_.begin());
+  vector<string> paths;
+
+  str::split(str_,':',&paths);
+
+  for(size_t i = 0; i < paths.size(); i++)
+    {
+      BranchVec tmp;
+
+      ::parse(paths[i],branches_->default_minfreespace,&tmp);
+
+      branches_->vec.insert(branches_->vec.end(),
+                            tmp.begin(),
+                            tmp.end());
+    }
 }
 
 static
 void
-erase_end(Branches &branches_)
+erase_begin(BranchVec *branches_)
 {
-  branches_.pop_back();
+  branches_->erase(branches_->begin());
 }
 
 static
 void
-erase_fnmatch(Branches          &branches_,
-              const std::string &str_)
+erase_end(BranchVec *branches_)
+{
+  branches_->pop_back();
+}
+
+static
+void
+erase_fnmatch(const std::string &str_,
+              Branches          *branches_)
 {
   vector<string> patterns;
 
   str::split(str_,':',&patterns);
 
-  for(Branches::iterator i = branches_.begin();
-      i != branches_.end();)
+  for(BranchVec::iterator i = branches_->vec.begin();
+      i != branches_->vec.end();)
     {
       int match = FNM_NOMATCH;
 
@@ -200,35 +333,36 @@ erase_fnmatch(Branches          &branches_,
           match = ::fnmatch(pi->c_str(),i->path.c_str(),0);
         }
 
-      i = ((match == 0) ? branches_.erase(i) : (i+1));
+      i = ((match == 0) ? branches_->vec.erase(i) : (i+1));
     }
 }
 
 int
 Branches::from_string(const std::string &s_)
 {
-  rwlock::WriteGuard guard(&lock);
+  rwlock::WriteGuard guard(lock);
+
   std::string instr;
   std::string values;
 
   ::split(s_,&instr,&values);
 
   if(instr == "+")
-    ::add_end(*this,values);
+    ::add_end(values,this);
   ef(instr == "+<")
-    ::add_begin(*this,values);
+    ::add_begin(values,this);
   ef(instr == "+>")
-    ::add_end(*this,values);
+    ::add_end(values,this);
   ef(instr == "-")
-    ::erase_fnmatch(*this,values);
+    ::erase_fnmatch(values,this);
   ef(instr == "-<")
-    ::erase_begin(*this);
+    ::erase_begin(&vec);
   ef(instr == "->")
-    ::erase_end(*this);
+    ::erase_end(&vec);
   ef(instr == "=")
-    ::set(*this,values);
+    ::set(values,this);
   ef(instr.empty())
-    ::set(*this,values);
+    ::set(values,this);
   else
     return -EINVAL;
 
@@ -238,30 +372,15 @@ Branches::from_string(const std::string &s_)
 string
 Branches::to_string(void) const
 {
-  rwlock::ReadGuard guard(&lock);
+  rwlock::ReadGuard guard(lock);
+
   string tmp;
 
-  for(size_t i = 0; i < size(); i++)
+  for(size_t i = 0; i < vec.size(); i++)
     {
-      const Branch &branch = (*this)[i];
+      const Branch &branch = vec[i];
 
-      tmp += branch.path;
-
-      tmp += '=';
-      switch(branch.mode)
-        {
-        default:
-        case Branch::RW:
-          tmp += "RW";
-          break;
-        case Branch::RO:
-          tmp += "RO";
-          break;
-        case Branch::NC:
-          tmp += "NC";
-          break;
-        }
-
+      tmp += branch.to_string();
       tmp += ':';
     }
 
@@ -274,11 +393,11 @@ Branches::to_string(void) const
 void
 Branches::to_paths(vector<string> &vec_) const
 {
-  rwlock::ReadGuard guard(&lock);
+  rwlock::ReadGuard guard(lock);
 
-  for(size_t i = 0; i < size(); i++)
+  for(size_t i = 0; i < vec.size(); i++)
     {
-      const Branch &branch = (*this)[i];
+      const Branch &branch = vec[i];
 
       vec_.push_back(branch.path);
     }
@@ -299,12 +418,13 @@ SrcMounts::from_string(const std::string &s_)
 std::string
 SrcMounts::to_string(void) const
 {
-  rwlock::ReadGuard guard(&_branches.lock);
+  rwlock::ReadGuard guard(_branches.lock);
+
   std::string rv;
 
-  for(uint64_t i = 0; i < _branches.size(); i++)
+  for(uint64_t i = 0; i < _branches.vec.size(); i++)
     {
-      rv += _branches[i].path;
+      rv += _branches.vec[i].path;
       rv += ':';
     }
 
